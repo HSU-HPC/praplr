@@ -1,6 +1,6 @@
 # praplr -- Parallel RAPL Reader
 
-This tiny utility (no dependencies) allows portable energy measurements of arbitrary applications across multiple nodes.
+This tiny utility (no dependencies) allows portable energy measurements of arbitrary applications across multiple nodes using the Linux [power capping framework](https://docs.kernel.org/power/powercap/powercap.html).
 
 ## How to use it
 
@@ -26,10 +26,19 @@ The per-node and total energy and power consumption can be generated using
 python3 analyze-measurements.py ./praplr-output
 ```
 
+Visualize the power utilization using
+
+```bash
+# pip install pandas plotly
+python3 plot-power.py ./praplr-output
+```
+
+![Example plot of derived RAPL power](example-plot.png)
+
 ## How it works
 
-For each node, a sampler process is started.  
-Initially, all processes try to bind to a local unix socket, which acts as the selection mechanism.
+For each node, exactly one sampler process is started.
+To achieve this, all processes try to bind to a local Unix socket, which acts as the selection mechanism.
 The winner creates a child process for sampling.  
 All (parent) processes proceed to be replaced with the main (MPI) application.  
-When these processes stop, the corresponding sampler is also stopped.
+When these processes terminate, the corresponding sampler processes are also terminated.

@@ -11,7 +11,7 @@ from pathlib import Path
 def read_energy_measurements_csv(path):
     """
     Read a energy-HOST.csv file.
-    The first column is "timestamp_ms" with subsequent RAPLZONE_energy_uj columns.
+    The first column is "timestamp_ms" with subsequent RAPLDOMAIN_energy_uj columns.
     """
     filename = os.path.basename(path)
     hostname = filename[7:-4]
@@ -56,7 +56,7 @@ def counter_delta(previous, current, max_energy_range_uj):
     return (max_energy_range_uj - previous) + current
 
 
-def calculate_power(rows, zone, max_energy_range_uj):
+def calculate_power(rows, domain, max_energy_range_uj):
     """
     Derive power from cumulative energy readings.
     Returns list of timestamp-power values.
@@ -69,8 +69,8 @@ def calculate_power(rows, zone, max_energy_range_uj):
         if dt_ms <= 0:
             continue
         delta_uj = counter_delta(
-            e0[zone],
-            e1[zone],
+            e0[domain],
+            e1[domain],
             max_energy_range_uj,
         )
         if math.isnan(delta_uj):
@@ -81,11 +81,11 @@ def calculate_power(rows, zone, max_energy_range_uj):
     return result
 
 
-def calculate_total_energy(rows, zone, max_energy_range_uj):
+def calculate_total_energy(rows, domain, max_energy_range_uj):
     total_uj = 0.0
     for i in range(1, len(rows)):
-        e0 = rows[i - 1][1][zone]
-        e1 = rows[i][1][zone]
+        e0 = rows[i - 1][1][domain]
+        e1 = rows[i][1][domain]
         delta = counter_delta(e0, e1, max_energy_range_uj)
         if math.isnan(delta):
             continue
@@ -116,10 +116,10 @@ def fmt(value):
 
 def write_summary_yaml(path, results):
     total_energy = sum(result["energy_j"] for result in results)
-    job_start = min(result["start_ms"] for result in results)
-    job_end = max(result["end_ms"] for result in results)
-    job_duration = (job_end - job_start) / 1000.0
-    job_average_power = total_energy / job_duration if job_duration > 0 else 0.0
+    start = min(result["start_ms"] for result in results)
+    end = max(result["end_ms"] for result in results)
+    duration = (end - start) / 1000.0
+    average_power = total_energy / duration if duration > 0 else 0.0
     with open(path, "w") as f:
         f.write("nodes:\n")
         for result in results:
@@ -132,61 +132,66 @@ def write_summary_yaml(path, results):
             f.write("    energy_J: {}\n".format(fmt(result["energy_j"])))
             f.write("    energy_kWh: {}\n".format(fmt(result["energy_j"] / 3600000.0)))
             f.write("    power_file: {}\n".format(result["power_file"]))
-            f.write("    zones:\n")
-            for zone in result["zones"]:
-                f.write("      - name: {}\n".format(zone["name"]))
+            f.write("    domains:\n")
+            for domain in result["domains"]:
+                f.write("      - name: {}\n".format(domain["name"]))
                 f.write(
-                    "        average_power_W: {}\n".format(fmt(zone["average_power_W"]))
+                    "        average_power_W: {}\n".format(
+                        fmt(domain["average_power_W"])
+                    )
                 )
-                f.write("        energy_J: {}\n".format(fmt(zone["energy_j"])))
+                f.write("        energy_J: {}\n".format(fmt(domain["energy_j"])))
                 f.write(
-                    "        energy_kWh: {}\n".format(fmt(zone["energy_j"] / 3600000.0))
+                    "        energy_kWh: {}\n".format(
+                        fmt(domain["energy_j"] / 3600000.0)
+                    )
                 )
         f.write("\n")
-        f.write("job:\n")
+        f.write("total:\n")
         f.write(f"  nodes: {len(results)}\n")
-        f.write(f"  start_ms: {job_start}\n")
-        f.write(f"  end_ms: {job_end}\n")
-        f.write(f"  duration_s: {fmt(job_duration)}\n")
-        f.write(f"  average_power_W: {fmt(job_average_power)}\n")
+        f.write(f"  start_ms: {start}\n")
+        f.write(f"  end_ms: {end}\n")
+        f.write(f"  duration_s: {fmt(duration)}\n")
+        f.write(f"  average_power_W: {fmt(average_power)}\n")
         f.write(f"  energy_J: {fmt(total_energy)}\n")
         f.write(f"  energy_kWh: {fmt(total_energy / 3600000.0)}\n")
 
 
-def transpose_power_rows(zone_power_rows):
+def transpose_power_rows(domain_power_rows):
     """
     Convert rows from list of timestamp-power pairs to pair of timestamp and list of power values
     """
-    if not zone_power_rows:
+    if not domain_power_rows:
         return []
     return [
         (
-            zone_power_rows[0][i][0],
+            domain_power_rows[0][i][0],
             [
-                zone_power_rows[zone_index][i][1]
-                for zone_index in range(len(zone_power_rows))
+                domain_power_rows[domain_index][i][1]
+                for domain_index in range(len(domain_power_rows))
             ],
         )
-        for i in range(len(zone_power_rows[0]))
+        for i in range(len(domain_power_rows[0]))
     ]
 
 
 def main():
     if len(sys.argv) != 2:
         print(
-            f"Usage: {sys.argv[0]} OUTPUT_PATH",
+            f"Usage: {sys.argv[0]} MEASUREMENTS_PATH",
             file=sys.stderr,
         )
         sys.exit(1)
-    output_path = Path(sys.argv[1])
-    files = sorted(output_path.glob("energy-*.csv"))
+    measurements_path = Path(sys.argv[1])
+    files = sorted(measurements_path.glob("energy-*.csv"))
     if not files:
         print(
-            f"No energy-*.csv files found in {output_path}",
+            f"No energy-*.csv files found in {measurements_path}",
             file=sys.stderr,
         )
         sys.exit(1)
     results = []
+
     # Process result for each host
     for energy_path in files:
         hostname, energy_header, energy_rows = read_energy_measurements_csv(energy_path)
@@ -196,50 +201,53 @@ def main():
                 file=sys.stderr,
             )
             continue
-        zone_names = energy_header[1:]
-        metadata_path = output_path / f"rapl-{hostname}.json"
+        domain_names = energy_header[1:]
+        metadata_path = measurements_path / f"rapl-{hostname}.json"
         metadata = read_rapl_metadata(metadata_path)
-        metadata_zones = metadata["zones"]
-        if len(metadata_zones) != len(zone_names):
+        metadata_domains = metadata["domains"]
+        if len(metadata_domains) != len(domain_names):
             raise ValueError(
-                f"{energy_path}: CSV has {len(zone_names)} zones, "
-                f"metadata has {len(metadata_zones)} zones"
+                f"{energy_path}: CSV has {len(domain_names)} domains, "
+                f"metadata has {len(metadata_domains)} domains"
             )
-        zones = []
-        zone_power_rows = []
+        domains = []
+        domain_power_rows = []
         duration_s = (energy_rows[-1][0] - energy_rows[0][0]) / 1000.0
-        # Calculate power and energy for each zone
-        for zone_index, zone_name in enumerate(zone_names):
-            metadata_zone = metadata_zones[zone_index]
-            max_energy_range_uj = metadata_zone["max_energy_range_uj"]
-            zone_power = calculate_power(
+
+        # Calculate power and energy for each domain
+        for domain_index, domain_name in enumerate(domain_names):
+            metadata_domain = metadata_domains[domain_index]
+            max_energy_range_uj = metadata_domain["max_energy_range_uj"]
+            domain_power = calculate_power(
                 energy_rows,
-                zone_index,
+                domain_index,
                 max_energy_range_uj,
             )
-            zone_power_rows.append(zone_power)
+            domain_power_rows.append(domain_power)
             energy_j = calculate_total_energy(
                 energy_rows,
-                zone_index,
+                domain_index,
                 max_energy_range_uj,
             )
             average_power = energy_j / duration_s if duration_s > 0 else 0.0
-            zones.append(
+            domains.append(
                 {
-                    "name": zone_name,
+                    "name": domain_name,
                     "energy_j": energy_j,
                     "average_power_W": average_power,
                 }
             )
+
         # Compute node statistics
-        energy_j = sum(zone["energy_j"] for zone in zones)
+        energy_j = sum(domain["energy_j"] for domain in domains)
         start_ms = energy_rows[0][0]
         end_ms = energy_rows[-1][0]
         duration_s = (end_ms - start_ms) / 1000.0
         average_power = energy_j / duration_s if duration_s > 0 else 0.0
+
         # Write power-HOST.csv
-        power_path = output_path / f"power-{hostname}.csv"
-        power_rows = transpose_power_rows(zone_power_rows)
+        power_path = measurements_path / f"power-{hostname}.csv"
+        power_rows = transpose_power_rows(domain_power_rows)
         write_power_csv(
             power_path,
             energy_header,
@@ -255,7 +263,7 @@ def main():
                 "average_power_W": average_power,
                 "energy_j": energy_j,
                 "power_file": power_path.name,
-                "zones": zones,
+                "domains": domains,
             }
         )
     if not results:
@@ -264,8 +272,9 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+
     # Write summary
-    summary_path = output_path / "summary.yaml"
+    summary_path = measurements_path / "summary.yaml"
     write_summary_yaml(
         summary_path,
         results,

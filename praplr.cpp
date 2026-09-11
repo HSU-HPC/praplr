@@ -83,7 +83,7 @@ int shouldSample(const std::string &outputPath) {
   throw std::runtime_error(std::string("bind() failed: ") + std::strerror(error));
 }
 
-struct RaplZone {
+struct RaplDomain {
   std::string name;
   std::string energyPath;
   uint64_t maxEnergy;
@@ -100,37 +100,47 @@ std::string readFile(const std::string &path) {
   return value;
 }
 
-std::vector<RaplZone> findRaplZones() {
-  const std::string base = "/sys/class/powercap/intel-rapl";
-  std::vector<RaplZone> zones;
-  for (int package = 0;; ++package) {
-    const std::string zone = base + "/intel-rapl:" + std::to_string(package);
-    const std::string energyPath = zone + "/energy_uj";
-    const std::string maxEnergyPath = zone + "/max_energy_range_uj";
-    if (access(energyPath.c_str(), R_OK) != 0)
-      break;
-    zones.push_back({readFile(zone + "/name"), energyPath, std::stoull(readFile(maxEnergyPath))});
+std::vector<RaplDomain> findRaplDomains() {
+  namespace fs = std::filesystem;
+  const fs::path base = "/sys/class/powercap/intel-rapl";
+  std::vector<RaplDomain> domains;
+  if (!fs::exists(base))
+    throw std::runtime_error("RAPL powercap directory not found: " + base.string());
+  for (const auto &entry : fs::recursive_directory_iterator(base)) {
+    if (!entry.is_directory())
+      continue;
+    const fs::path domain = entry.path();
+    const fs::path energyPath = domain / "energy_uj";
+    const fs::path maxEnergyPath = domain / "max_energy_range_uj";
+    const fs::path namePath = domain / "name";
+    // Detect RAPL domain by exposed objects
+    if (!fs::is_regular_file(energyPath) || !fs::is_regular_file(maxEnergyPath) ||
+        !fs::is_regular_file(namePath)) {
+      continue;
+    }
+    domains.push_back({readFile(namePath.string()), energyPath.string(),
+                       std::stoull(readFile(maxEnergyPath.string()))});
   }
-  if (zones.empty())
-    throw std::runtime_error("No Intel RAPL zones found under " + base);
-  return zones;
+  if (domains.empty())
+    throw std::runtime_error("No Intel RAPL domains found under " + base.string());
+  return domains;
 }
 
-void writeZoneMetadata(const std::string &path, const std::vector<RaplZone> &zones) {
+void writeDomainMetadata(const std::string &path, const std::vector<RaplDomain> &domains) {
   std::ofstream output(path);
   if (!output)
     throw std::runtime_error("Could not open metadata file: " + path);
   output << "{\n";
   output << "  \"hostname\": \"" << getHostname() << "\",\n";
-  output << "  \"zones\": [\n";
-  for (size_t i = 0; i < zones.size(); ++i) {
-    const auto &zone = zones[i];
+  output << "  \"domains\": [\n";
+  for (size_t i = 0; i < domains.size(); ++i) {
+    const auto &domain = domains[i];
     output << "    {\n";
-    output << "      \"name\": \"" << zone.name << "\",\n";
-    output << "      \"energy_path\": \"" << zone.energyPath << "\",\n";
-    output << "      \"max_energy_range_uj\": " << zone.maxEnergy << "\n";
+    output << "      \"name\": \"" << domain.name << "\",\n";
+    output << "      \"energy_path\": \"" << domain.energyPath << "\",\n";
+    output << "      \"max_energy_range_uj\": " << domain.maxEnergy << "\n";
     output << "    }";
-    if (i + 1 != zones.size())
+    if (i + 1 != domains.size())
       output << ",";
     output << "\n";
   }
@@ -138,11 +148,11 @@ void writeZoneMetadata(const std::string &path, const std::vector<RaplZone> &zon
   output << "}\n";
 }
 
-std::vector<uint64_t> readEnergy(const std::vector<RaplZone> &zones) {
+std::vector<uint64_t> readEnergy(const std::vector<RaplDomain> &domains) {
   std::vector<uint64_t> values;
-  values.reserve(zones.size());
-  for (const auto &zone : zones)
-    values.push_back(std::stoull(readFile(zone.energyPath)));
+  values.reserve(domains.size());
+  for (const auto &domain : domains)
+    values.push_back(std::stoull(readFile(domain.energyPath)));
   return values;
 }
 
@@ -170,18 +180,18 @@ void runSampler(const std::string &outputPath, int electionFd, int interval) {
     close(electionFd);
     std::_Exit(EXIT_SUCCESS);
   }
-  const auto zones = findRaplZones();
+  const auto domains = findRaplDomains();
   std::filesystem::create_directories(outputPath);
   const auto hostname = getHostname();
-  writeZoneMetadata(outputPath + "/rapl-" + hostname + ".json", zones);
+  writeDomainMetadata(outputPath + "/rapl-" + hostname + ".json", domains);
   std::ofstream output(outputPath + "/energy-" + hostname + ".csv");
   if (!output) {
     throw std::runtime_error("Could not open output file");
   }
   // Header.
   output << "timestamp_ms";
-  for (const auto &zone : zones)
-    output << "," << zone.name << "_energy_uj";
+  for (const auto &domain : domains)
+    output << "," << domain.name << "_energy_uj";
   output << '\n';
   output.flush();
   // Measurements.
@@ -189,7 +199,7 @@ void runSampler(const std::string &outputPath, int electionFd, int interval) {
     const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
-    const auto values = readEnergy(zones);
+    const auto values = readEnergy(domains);
     std::ostringstream row;
     row << timestamp;
     for (const auto value : values)

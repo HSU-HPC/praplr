@@ -23,7 +23,7 @@ or use it with another parallel launcher or even sequential codes.
 The per-node and total energy and power consumption can be generated using
 
 ```bash
-python3 analyze-measurements.py ./praplr-output
+python3 parplr-summarize.py ./praplr-output
 ```
 
 Visualize the power utilization using

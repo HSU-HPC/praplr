@@ -1,28 +1,49 @@
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
-
 #include <cstdint>
+#include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <sys/un.h>
-#include <sys/wait.h>
-#include <thread>
 #include <unistd.h>
 #include <vector>
+
+#include "praplr.h"
+#if defined(RAPL_METHOD_SYSFS) == defined(RAPL_METHOD_PERF)
+#error "Either RAPL_METHOD_SYSFS or RAPL_METHOD_PERF must be defined"
+#endif
+
+#ifdef RAPL_METHOD_PERF
+#include <linux/perf_event.h>
+#endif
 
 #define BIN_NAME "praplr"
 #define PRAPLR_INTERVAL_MS_ENV_KEY "PRAPLR_INTERVAL_MS"
 #define PRAPLR_INTERVAL_MS_DEFAULT 500
 
-static constexpr const char *SOCKET_PREFIX = BIN_NAME;
+namespace fs = std::filesystem;
+
+static volatile std::sig_atomic_t isStopped = 0;
+
+void handleSignal(int) {
+  isStopped = 1;
+}
 
 std::string getHostname() {
   char hostname[256];
@@ -58,8 +79,16 @@ std::string absolutePath(const std::string &path) {
   return fs::canonical(outputPath).string();
 }
 
+inline std::string getInstanceName(const std::string &outputPath) {
+    return std::string(BIN_NAME) + ":" + hashPath(outputPath);
+}
+
+inline std::string getLockPath(const std::string &outputPath) {
+    return "/dev/shm/" + getInstanceName(outputPath) + ".lock";
+}
+
 int shouldSample(const std::string &outputPath) {
-  std::string socketName = std::string(BIN_NAME) + ":" + hashPath(outputPath.c_str());
+  std::string socketName = getInstanceName(outputPath);
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd == -1)
     throw std::runtime_error(std::string("socket() failed: ") + std::strerror(errno));
@@ -83,32 +112,47 @@ int shouldSample(const std::string &outputPath) {
   throw std::runtime_error(std::string("bind() failed: ") + std::strerror(error));
 }
 
-struct RaplDomain {
-  std::string name;
-  std::string energyPath;
-  uint64_t maxEnergy;
-};
-
-std::string readFile(const std::string &path) {
+std::string readFile(const fs::path &path) {
   std::ifstream file(path);
   if (!file)
-    throw std::runtime_error("Could not open " + path);
+    throw std::runtime_error("Could not open " + path.string());
   std::string value;
   std::getline(file, value);
   if (!file && !file.eof())
-    throw std::runtime_error("Could not read " + path);
+    throw std::runtime_error("Could not read " + path.string());
   return value;
 }
 
+#ifdef RAPL_METHOD_PERF
+struct RaplCounter {
+  int cpu = -1;
+  int fd = -1;
+};
+#endif
+
+struct RaplDomain {
+  std::string name;
+#ifdef RAPL_METHOD_SYSFS
+  fs::path energyPath;
+  uint64_t maxEnergy;
+#else
+  fs::path eventPath;
+  std::string unit = "J";
+  std::string scale = "1.0";
+  uint64_t config;
+  std::vector<RaplCounter> counters;
+#endif
+};
+
+#ifdef RAPL_METHOD_SYSFS
 std::vector<RaplDomain> findRaplDomains() {
-  namespace fs = std::filesystem;
-  const fs::path base = "/sys/class/powercap/intel-rapl";
   std::vector<RaplDomain> domains;
+  const fs::path base = "/sys/class/powercap/intel-rapl";
   if (!fs::exists(base))
     throw std::runtime_error("RAPL powercap directory not found: " + base.string());
   for (const auto &entry : fs::recursive_directory_iterator(base)) {
-    if (!entry.is_directory())
-      continue;
+    if (entry.is_symlink() || !entry.is_directory())
+        continue;
     const fs::path domain = entry.path();
     const fs::path energyPath = domain / "energy_uj";
     const fs::path maxEnergyPath = domain / "max_energy_range_uj";
@@ -118,13 +162,151 @@ std::vector<RaplDomain> findRaplDomains() {
         !fs::is_regular_file(namePath)) {
       continue;
     }
-    domains.push_back({readFile(namePath.string()), energyPath.string(),
-                       std::stoull(readFile(maxEnergyPath.string()))});
+    const auto namePrefix = domain.filename().string();
+    const auto name = namePrefix + "_" + readFile(namePath);
+    domains.push_back({name, energyPath, std::stoull(readFile(maxEnergyPath))});
   }
   if (domains.empty())
     throw std::runtime_error("No Intel RAPL domains found under " + base.string());
   return domains;
 }
+#endif
+
+#ifdef RAPL_METHOD_PERF
+void resetAndEnableDomains(std::vector<RaplDomain> &domains) {
+  // Reset all
+  for (auto &domain : domains)
+    for (auto &counter : domain.counters) {
+      if (ioctl(counter.fd, PERF_EVENT_IOC_RESET, 0) == -1) {
+        const int error = errno;
+        throw std::runtime_error("PERF_EVENT_IOC_RESET failed for " + domain.name + " on CPU " +
+                                 std::to_string(counter.cpu) + ": " + std::strerror(error));
+      }
+    }
+  // Enable all
+  for (auto &domain : domains)
+    for (auto &counter : domain.counters) {
+      if (ioctl(counter.fd, PERF_EVENT_IOC_ENABLE, 0) == -1) {
+        const int error = errno;
+        throw std::runtime_error("PERF_EVENT_IOC_ENABLE failed for " + domain.name + " on CPU " +
+                                 std::to_string(counter.cpu) + ": " + std::strerror(error));
+      }
+    }
+}
+
+template <typename F> struct ScopeExit {
+  F fn;
+  ~ScopeExit() noexcept {
+    fn();
+  }
+};
+
+void disableCountersAndCloseDomains(std::vector<RaplDomain> &domains) {
+  // Disable counters
+  for (auto &domain : domains)
+    for (auto &counter : domain.counters) {
+      if (counter.fd >= 0)
+        ioctl(counter.fd, PERF_EVENT_IOC_DISABLE, 0);
+    }
+  // Close domains
+  for (auto &domain : domains)
+    for (auto &counter : domain.counters) {
+      if (counter.fd < 0)
+        continue;
+      close(counter.fd);
+      counter.fd = -1;
+    }
+}
+
+std::vector<int> readCpuMask(const fs::path cpumask) {
+  std::vector<int> cpus;
+  std::stringstream ss(readFile(cpumask));
+  std::string part;
+  while (std::getline(ss, part, ',')) {
+    auto dash = part.find('-');
+    if (dash == std::string::npos) {
+      cpus.push_back(std::stoi(part));
+    } else {
+      int start = std::stoi(part.substr(0, dash));
+      int end = std::stoi(part.substr(dash + 1));
+      for (int i = start; i <= end; ++i)
+        cpus.push_back(i);
+    }
+  }
+  return cpus;
+}
+
+std::vector<RaplDomain> findRaplDomains() {
+  std::vector<RaplDomain> domains;
+  const fs::path base = "/sys/bus/event_source/devices/power";
+  if (!fs::exists(base))
+    throw std::runtime_error("perf power PMU not found: " + base.string());
+  const fs::path eventsPath = base / "events";
+  if (!fs::exists(eventsPath)) {
+    throw std::runtime_error("perf power PMU events directory not found: " + eventsPath.string());
+  }
+  const fs::path typePath = base / "type";
+  if (!fs::exists(typePath)) {
+    throw std::runtime_error("perf power PMU type file not found: " + typePath.string());
+  }
+  const uint32_t pmuType = std::stoul(readFile(typePath));
+  const fs::path cpumaskPath = base / "cpumask";
+  if (!fs::exists(cpumaskPath)) {
+    throw std::runtime_error("perf power PMU cpumask not found: " + cpumaskPath.string());
+  }
+  const std::vector<int> socketCpus = readCpuMask(cpumaskPath);
+  for (const auto &entry : fs::directory_iterator(eventsPath)) {
+    if (!entry.is_regular_file())
+      continue;
+    const std::string eventName = entry.path().filename().string();
+    if (eventName.rfind("energy-", 0) != 0 || eventName.ends_with(".scale") ||
+        eventName.ends_with(".unit")) {
+      continue;
+    }
+    const std::string eventDescription = readFile(entry.path());
+    const std::string configString = eventDescription.substr(6);
+    uint64_t config = std::stoull(configString, nullptr, 0); // Hex format
+    RaplDomain domain;
+    domain.name = eventName;
+    domain.eventPath = entry.path();
+    domain.config = config;
+    const fs::path scalePath = eventsPath / (eventName + ".scale");
+    if (fs::exists(scalePath))
+      domain.scale = readFile(scalePath);
+    const fs::path unitPath = eventsPath / (eventName + ".unit");
+    if (fs::exists(unitPath))
+      domain.unit = readFile(unitPath);
+    for (const int cpu : socketCpus) {
+      struct perf_event_attr attr {};
+      attr.type = pmuType;
+      attr.size = sizeof(attr);
+      attr.config = config;
+      attr.disabled = 1; // Jointly enable later
+      // Measure system (not just process) for comparability to sysfs method:
+      // (s. https://man7.org/linux/man-pages/man2/perf_event_open.2.html)
+      attr.exclude_kernel = 0;
+      attr.exclude_hv = 0;
+      const int fd = syscall(__NR_perf_event_open, &attr,
+                             -1, // pid
+                             cpu,
+                             -1, // groupFd
+                             0   // flags
+      );
+      if (fd == -1) {
+        std::cerr << "perf_event_open(" << eventName << ", cpu " << cpu
+                  << "): " << std::strerror(errno) << std::endl;
+        continue;
+      }
+      domain.counters.push_back({cpu, fd});
+    }
+    if (!domain.counters.empty())
+      domains.push_back(domain);
+  }
+  if (domains.empty())
+    throw std::runtime_error("No usable perf RAPL energy events found under " + base.string());
+  return domains;
+}
+#endif
 
 void writeDomainMetadata(const std::string &path, const std::vector<RaplDomain> &domains) {
   std::ofstream output(path);
@@ -132,13 +314,34 @@ void writeDomainMetadata(const std::string &path, const std::vector<RaplDomain> 
     throw std::runtime_error("Could not open metadata file: " + path);
   output << "{\n";
   output << "  \"hostname\": \"" << getHostname() << "\",\n";
+  output << "  \"method\": \"" <<
+#ifdef RAPL_METHOD_SYSFS
+      "sysfs"
+#else
+      "perf"
+#endif
+         << "\",\n";
   output << "  \"domains\": [\n";
   for (size_t i = 0; i < domains.size(); ++i) {
     const auto &domain = domains[i];
     output << "    {\n";
     output << "      \"name\": \"" << domain.name << "\",\n";
-    output << "      \"energy_path\": \"" << domain.energyPath << "\",\n";
+#ifdef RAPL_METHOD_SYSFS
+    output << "      \"energy_path\": \"" << domain.energyPath.string() << "\",\n";
     output << "      \"max_energy_range_uj\": " << domain.maxEnergy << "\n";
+#else
+    output << "      \"event_path\": \"" << domain.eventPath.string() << "\",\n";
+    output << "      \"config\": " << domain.config << ",\n";
+    output << "      \"unit\": \"" << domain.unit << "\",\n";
+    output << "      \"scale\": " << domain.scale << ",\n";
+    output << "      \"cpus\": [";
+    for (size_t j = 0; j < domain.counters.size(); ++j) {
+      if (j != 0)
+        output << ", ";
+      output << domain.counters[j].cpu;
+    }
+    output << "]\n";
+#endif
     output << "    }";
     if (i + 1 != domains.size())
       output << ",";
@@ -151,8 +354,24 @@ void writeDomainMetadata(const std::string &path, const std::vector<RaplDomain> 
 std::vector<uint64_t> readEnergy(const std::vector<RaplDomain> &domains) {
   std::vector<uint64_t> values;
   values.reserve(domains.size());
-  for (const auto &domain : domains)
+  for (const auto &domain : domains) {
+#ifdef RAPL_METHOD_SYSFS
     values.push_back(std::stoull(readFile(domain.energyPath)));
+#else
+    uint64_t total = 0;
+    for (const auto &counter : domain.counters) {
+      uint64_t value = 0;
+      const ssize_t result = read(counter.fd, &value, sizeof(value));
+      if (result != static_cast<ssize_t>(sizeof(value))) {
+        const int error = errno;
+        throw std::runtime_error("Could not read perf counter for " + domain.name + " on CPU " +
+                                 std::to_string(counter.cpu) + ": " + std::strerror(error));
+      }
+      total += value;
+    }
+    values.push_back(total);
+#endif
+  }
   return values;
 }
 
@@ -168,19 +387,55 @@ int getIntervalMs() {
   return static_cast<int>(interval);
 }
 
-void runSampler(const std::string &outputPath, int electionFd, int interval) {
-  // Remember the parent so we can close the small fork()/prctl() race.
+constexpr uint64_t NsPerSec = 1000000000ULL;
+constexpr uint64_t NsPerMs = NsPerSec / 1000;
+
+uint64_t getTimestampNs(clockid_t clock) {
+  timespec ts;
+  if (clock_gettime(clock, &ts) != 0) {
+    throw std::runtime_error(std::string("clock_gettime failed: ") + std::strerror(errno));
+  }
+  return static_cast<uint64_t>(ts.tv_sec) * NsPerSec + ts.tv_nsec;
+}
+
+void sleepUntil(uint64_t timestampMonotonicNs) {
+  timespec ts{static_cast<time_t>(timestampMonotonicNs / NsPerSec),
+              static_cast<long>(timestampMonotonicNs % NsPerSec)};
+  int result;
+  do {
+    if (isStopped)
+      return;
+    result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
+  } while (result == EINTR);
+  if (result != 0)
+    throw std::runtime_error(std::string("clock_nanosleep failed: ") + std::strerror(result));
+}
+
+int acquireSharedLock(const std::string &outputPath) {
+  const std::string path = getLockPath(outputPath);
+  int fd = open(path.c_str(), O_RDONLY | O_CREAT, 0666);   // no O_CLOEXEC: must survive exec
+  if (fd == -1 || flock(fd, LOCK_SH) != 0)
+    throw std::runtime_error(std::string("shared lock failed: ") + std::strerror(errno));
+  return fd;
+}
+
+void runSampler(const std::string &outputPath, int intervalMs) {
   const pid_t parentPid = getppid();
   if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
     throw std::runtime_error(std::string("prctl(PR_SET_PDEATHSIG) failed: ") +
                              std::strerror(errno));
   }
-  if (getppid() != parentPid) {
-    // Parent died before we installed the death signal.
-    close(electionFd);
-    std::_Exit(EXIT_SUCCESS);
-  }
-  const auto domains = findRaplDomains();
+  if (getppid() != parentPid) std::_Exit(EXIT_SUCCESS);
+  auto domains = findRaplDomains();
+  std::sort(domains.begin(), domains.end(),
+            [](const RaplDomain &a, const RaplDomain &b) { return a.name < b.name; });
+  for (size_t i = 1; i < domains.size(); ++i)
+    if (domains[i].name == domains[i - 1].name)
+      throw std::runtime_error("Duplicate RAPL domain name: " + domains[i].name);
+#ifdef RAPL_METHOD_PERF
+  ScopeExit cleanup([&]() { disableCountersAndCloseDomains(domains); });
+  resetAndEnableDomains(domains);
+#endif
   std::filesystem::create_directories(outputPath);
   const auto hostname = getHostname();
   writeDomainMetadata(outputPath + "/rapl-" + hostname + ".json", domains);
@@ -191,27 +446,43 @@ void runSampler(const std::string &outputPath, int electionFd, int interval) {
   // Header.
   output << "timestamp_ms";
   for (const auto &domain : domains)
-    output << "," << domain.name << "_energy_uj";
+    output << "," << domain.name << "_energy";
   output << '\n';
   output.flush();
+  const std::string lockPath = getLockPath(outputPath);
+  const int probeFd = open(lockPath.c_str(), O_RDONLY);
+  if (probeFd == -1)
+    throw std::runtime_error("Could not open lock file: " + std::string(std::strerror(errno)));
   // Measurements.
-  while (true) {
-    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
-    const auto values = readEnergy(domains);
+  const uint64_t intervalNs = intervalMs * NsPerMs;
+  uint64_t nextWakeNs = getTimestampNs(CLOCK_MONOTONIC);
+  for (size_t i = 0; !isStopped; i++) {
+    if (
+        i > 0 // At least one measurement was taken
+        &&
+        flock(probeFd, LOCK_EX | LOCK_NB) == 0 // No other processes are found
+    ){
+        break;
+    }
     std::ostringstream row;
-    row << timestamp;
+    uint64_t measurementNs = getTimestampNs(CLOCK_REALTIME);
+    row << measurementNs / NsPerMs;
+    const auto values = readEnergy(domains);
     for (const auto value : values)
       row << "," << value;
     row << '\n';
     output << row.str();
     output.flush();
-    std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+    nextWakeNs += intervalNs;
+    sleepUntil(nextWakeNs);
   }
+  // Re-lock just to be sure
+  if (flock(probeFd, LOCK_EX | LOCK_NB) == 0)
+    unlink(lockPath.c_str());
+  close(probeFd);
 }
 
-void startSampler(const std::string &outputPath, int electionFd, int interval) {
+void startSampler(const std::string &outputPath, int electionFd, int lockFd, int intervalMs) {
   std::cerr << "Starting sampler for host " << getHostname() << " (PID " << getpid() << ")"
             << std::endl;
   pid_t pid = fork();
@@ -219,12 +490,15 @@ void startSampler(const std::string &outputPath, int electionFd, int interval) {
     throw std::runtime_error(std::string("fork() failed: ") + std::strerror(errno));
   }
   if (pid == 0) {
+      close(lockFd);
+    int status = EXIT_SUCCESS;
     try {
-      runSampler(outputPath, electionFd, interval);
+      runSampler(outputPath, intervalMs);
     } catch (const std::exception &e) {
       std::cerr << BIN_NAME << " sampler: " << e.what() << '\n';
+      status = EXIT_FAILURE;
     }
-    std::_Exit(EXIT_FAILURE);
+    std::_Exit(status);
   }
   // IMPORTANT:
   // The parent must close its copy of electionFd here.
@@ -232,7 +506,8 @@ void startSampler(const std::string &outputPath, int electionFd, int interval) {
 }
 
 [[noreturn]]
-void startApplication(int argc, char **argv) {
+void startApplication(char **argv) {
+std::signal(SIGPIPE, SIG_DFL);
   execvp(argv[0], &argv[0]);
   // Only reached if execvp failed.
   std::cerr << "execvp(" << argv[0] << ") failed: " << std::strerror(errno) << std::endl;
@@ -268,18 +543,26 @@ Arguments parseArguments(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+  std::signal(SIGTERM, handleSignal);
+  std::signal(SIGINT, handleSignal);
+  std::signal(SIGPIPE, SIG_IGN); // Avoid pipe-related termination
+  constexpr int EXIT_STOPPED = 130;
   try {
     Arguments args = parseArguments(argc, argv);
     std::string outputPath = absolutePath(args.outputPath);
+    const int lockFd = acquireSharedLock(outputPath);
     int electionFd = shouldSample(outputPath);
     if (electionFd) {
-      // Give the other MPI ranks time to reach the election.
-      // (Required in case the application exists immediately.)
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-      startSampler(outputPath, electionFd, getIntervalMs());
+      if (isStopped) {
+        close(electionFd);
+        return EXIT_STOPPED;
+      }
+      startSampler(outputPath, electionFd, lockFd, getIntervalMs());
     }
-    // Strip wrapper from args
-    startApplication(argc - args.applicationIndex, &argv[args.applicationIndex]);
+    if (isStopped)
+      return EXIT_STOPPED;
+    // Strip wrapper from args<w
+    startApplication(&argv[args.applicationIndex]);
   } catch (const std::exception &e) {
     std::cerr << "\n" << BIN_NAME << ": " << e.what() << std::endl;
     return EXIT_FAILURE;

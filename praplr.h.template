@@ -1,0 +1,2 @@
+#define RAPL_METHOD_SYSFS
+//#define RAPL_METHOD_PERF

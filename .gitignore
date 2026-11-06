@@ -1,6 +1,9 @@
 # Executable
 praplr
 
+# Config headre
+praplr.h
+
 # Measurements
 **/energy-*.csv
 **/power-*.csv
